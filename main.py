@@ -36,6 +36,8 @@ from models import (
     RandomExplainer,
     AdaptiveSmartShapLOO,
     ScreenerSmartShap,
+    ClusterSmartShapExplainer,
+    CrossEncoderBaselineExplainer,
 )
 from xai_evaluator import XAIEvaluator
 
@@ -210,6 +212,49 @@ def build_explainer(
     if mode == "screener_smartshap":
         return ScreenerSmartShap(model, sentences, query, top_k=5)
 
+    if mode == "cluster_smartshap":
+        return ClusterSmartShapExplainer(
+            model, sentences, query,
+            max_clusters=8,
+            redistribution="recursive",
+            sentence_max_samples=ns_smart,
+            cluster_max_samples=ns_smart,
+            batch_size=32,
+            random_state=seed,
+            use_loo_calibration=True,
+            scoring="bi_encoder",
+        )
+ 
+    if mode == "cluster_smartshap_attention":
+        return ClusterSmartShapExplainer(
+            model, sentences, query,
+            max_clusters=8,
+            redistribution="attention",
+            sentence_max_samples=ns_smart,
+            cluster_max_samples=ns_smart,
+            batch_size=32,
+            random_state=seed,
+            use_loo_calibration=True,
+            scoring="bi_encoder",
+        )
+ 
+    if mode == "cluster_cross_smartshap":
+        return ClusterSmartShapExplainer(
+            model, sentences, query,
+            max_clusters=8,
+            redistribution="recursive",
+            sentence_max_samples=ns_smart,
+            cluster_max_samples=ns_smart,
+            batch_size=32,
+            cross_batch_size=16,
+            random_state=seed,
+            use_loo_calibration=True,
+            scoring="cross_encoder",
+        )
+ 
+    if mode == "baseline_cross":
+        return CrossEncoderBaselineExplainer(model, sentences, query)
+ 
     if mode == "baseline_kernel":
         return BaselineExplainer(model, sentences, query)
 
@@ -243,7 +288,12 @@ def run_single_explanation(
         seed=seed,
     )
 
-    if mode in ["smartshap", "smartshap_sentence", "loo_shap", "adaptive_smartshap_loo", "screener_smartshap"]:
+    if mode in [
+        "smartshap", "smartshap_sentence", "loo_shap",
+        "adaptive_smartshap_loo", "screener_smartshap",
+        "cluster_smartshap", "cluster_smartshap_attention",
+        "cluster_cross_smartshap",
+    ]:
         values = explainer.explain(n_samples=ns_smart)
 
     elif mode == "banzhaf":
@@ -255,7 +305,7 @@ def run_single_explanation(
     elif mode in ["lime", "loo", "random"]:
         values = explainer.explain()
 
-    elif mode in ["baseline_kernel", "vanilla_shap"]:
+    elif mode in ["baseline_kernel", "vanilla_shap","baseline_cross"]:
         values = explainer.explain(n_samples=ns_base)
 
     else:

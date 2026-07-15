@@ -11,7 +11,7 @@ from lime.lime_text import LimeTextExplainer
 from sentence_transformers import CrossEncoder, SentenceTransformer
 from sklearn.linear_model import LinearRegression
 from sklearn.preprocessing import MaxAbsScaler
-
+from sklearn.cluster import AgglomerativeClustering
 try:
     from huggingface_hub import login
 except ImportError:
@@ -959,3 +959,391 @@ class ScreenerSmartShap:
             full_vals[global_idx] = sub_vals[i]
 
         return full_vals
+
+#Clustering SmartSHAP
+
+def cluster_sentence_indices(
+    model,
+    sentences,
+    max_clusters=8,
+    batch_size=32,
+    linkage="average",
+    metric="cosine",
+):
+    """
+    Semantic clustering of sentence indices using bi-encoder embeddings.
+ 
+    If the document already has <= max_clusters sentences, clustering is
+    skipped and each sentence becomes its own singleton cluster — in that
+    case ClusterSmartShapExplainer degenerates exactly to the original
+    SmartShapExplainer (no information loss, no unnecessary clustering).
+ 
+    Returns:
+        list[list[int]] — each inner list is the sentence indices belonging
+        to one cluster, ordered by the smallest member index for determinism.
+    """
+    n = len(sentences)
+    if n == 0:
+        return []
+    if n <= max_clusters:
+        return [[i] for i in range(n)]
+ 
+    embeddings = model.encode_texts(sentences, batch_size=batch_size, convert_to_numpy=True)
+    embeddings = np.asarray(embeddings, dtype=np.float32)
+    if embeddings.ndim == 1:
+        embeddings = embeddings.reshape(1, -1)
+ 
+    norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+    norms[norms < 1e-12] = 1e-12
+    embeddings = embeddings / norms
+ 
+    n_clusters = max(1, min(int(max_clusters), n))
+ 
+    try:
+        clustering = AgglomerativeClustering(
+            n_clusters=n_clusters,
+            metric=metric,
+            linkage=linkage,
+        )
+        labels = clustering.fit_predict(embeddings)
+    except TypeError:
+        # Older scikit-learn versions use `affinity` instead of `metric`.
+        clustering = AgglomerativeClustering(
+            n_clusters=n_clusters,
+            affinity=metric,
+            linkage=linkage,
+        )
+        labels = clustering.fit_predict(embeddings)
+ 
+    clusters_map = {}
+    for idx, label in enumerate(labels):
+        clusters_map.setdefault(int(label), []).append(idx)
+ 
+    clusters = sorted(clusters_map.values(), key=lambda members: min(members))
+    return clusters
+ 
+ 
+def _score_unit_combinations(model, query, unit_texts, combinations, scoring, batch_size, cross_batch_size):
+    """Batch-score every sampled coalition of "units" (sentences or clusters)."""
+    texts = [
+        " ".join(unit_texts[i] for i in comb).strip()
+        for comb in combinations
+    ]
+    if scoring == "cross_encoder":
+        scores = model.predict_score_cross_batch(query, texts, batch_size=cross_batch_size)
+    else:
+        scores = model.predict_score_batch(query, texts, batch_size=batch_size)
+    return np.asarray(scores, dtype=float).reshape(-1)
+ 
+ 
+def _loo_unit_drops_batch(model, query, unit_texts, scoring="bi_encoder", batch_size=32, cross_batch_size=16):
+    """
+    Generic Leave-One-Out drop, operating over abstract "units" (sentences OR
+    cluster texts) instead of only sentences — same idea as
+    `_loo_sentence_drops_batch`, generalized to be reusable at any hierarchy level.
+    """
+    n = len(unit_texts)
+    if n == 0:
+        return np.array([], dtype=float)
+ 
+    full_text = " ".join(unit_texts).strip()
+    reduced_texts = [
+        " ".join(unit_texts[:i] + unit_texts[i + 1:]).strip()
+        for i in range(n)
+    ]
+    texts = [full_text] + reduced_texts
+ 
+    if scoring == "cross_encoder":
+        scores = model.predict_score_cross_batch(query, texts, batch_size=cross_batch_size)
+    else:
+        scores = model.predict_score_batch(query, texts, batch_size=batch_size)
+    scores = np.asarray(scores, dtype=float).reshape(-1)
+ 
+    if scores.size != n + 1:
+        return np.zeros(n, dtype=float)
+ 
+    full_score = float(scores[0])
+    return full_score - scores[1:]
+ 
+ 
+def _smartshap_core_from_units(
+    model,
+    query,
+    unit_texts,
+    scoring="bi_encoder",
+    max_samples=200,
+    batch_size=32,
+    cross_batch_size=16,
+    random_state=42,
+    use_loo_calibration=True,
+    shap_weight=0.65,
+    return_raw_coef=False,
+):
+    """
+    Generic SmartSHAP engine: structured coalition sampling + kernel-weighted
+    linear surrogate + optional LOO calibration — operating over abstract
+    "units" (each unit_text is one player). A unit can be a single sentence
+    (normal SmartSHAP) or a concatenated cluster text (Cluster-SmartSHAP).
+ 
+    This mirrors SmartShapExplainer.explain() exactly, only generalized so it
+    can be reused at both the cluster level and, recursively, inside a
+    cluster during redistribution.
+ 
+    Returns:
+        normalized attribution (max-abs, in [-1, 1]) by default, or the raw
+        (unnormalized) regression coefficients if return_raw_coef=True — the
+        raw coefficients are what should be used when the values will later
+        be rescaled to satisfy the efficiency axiom (sum = parent value).
+    """
+    n = len(unit_texts)
+    if n == 0:
+        return np.array([], dtype=float)
+    if n == 1:
+        return np.array([1.0], dtype=float)
+ 
+    combinations = generate_shap_samples(n, max_samples, random_state)
+    scores = _score_unit_combinations(
+        model, query, unit_texts, combinations, scoring, batch_size, cross_batch_size
+    )
+ 
+    rows = []
+    for comb, sc in zip(combinations, scores):
+        row = {f"sent_{i}": 1 if i in comb else 0 for i in range(n)}
+        row.update({
+            "similarity": float(sc),
+            "weight": _kernel_shap_weight(n, len(comb)),
+        })
+        rows.append(row)
+ 
+    coef, shap_norm, _ = fit_shap_model_from_rows(rows, n)
+    shap_component = _max_abs_normalize(shap_norm)
+ 
+    if use_loo_calibration and n > 1:
+        loo_raw = _loo_unit_drops_batch(
+            model, query, unit_texts,
+            scoring=scoring, batch_size=batch_size, cross_batch_size=cross_batch_size,
+        )
+        loo_component = _max_abs_normalize(loo_raw)
+        final_norm = shap_weight * shap_component + (1.0 - shap_weight) * loo_component
+    else:
+        final_norm = shap_component.copy()
+ 
+    final_norm = _max_abs_normalize(final_norm)
+ 
+    if return_raw_coef:
+        return coef
+    return final_norm
+ 
+ 
+class ClusterSmartShapExplainer:
+    """
+    Hierarchical SmartSHAP.
+ 
+    Pipeline:
+        sentences --(semantic clustering)--> clusters
+                  --(SmartSHAP core, cluster-level)--> cluster attribution
+                  --(redistribution)--> sentence attribution
+ 
+    Redistribution modes:
+    - "recursive" (default, recommended): re-run the SmartSHAP core INSIDE
+      each cluster (coalition sampling + LOO calibration still apply at the
+      sentence level), then rescale so the sentence values inside a cluster
+      sum exactly to that cluster's raw Shapley coefficient. This preserves
+      the Shapley efficiency axiom end-to-end and keeps SmartSHAP's ability
+      to capture sentence-sentence interaction inside a cluster.
+    - "attention": cheaper heuristic — split the cluster value across member
+      sentences proportionally to their individual query-similarity
+      (softmax). Does not run coalition sampling inside the cluster, so it
+      does not capture intra-cluster interaction; provided mainly as a fast
+      baseline to quantify the "cost" of skipping recursive redistribution
+      (see the ablation design discussed for the thesis).
+ 
+    scoring:
+    - "bi_encoder" (default): explains RecommenderModel.predict_score /
+      predict_score_batch (BAAI/bge-m3-style embedding similarity).
+    - "cross_encoder": explains RecommenderModel.predict_score_cross_batch
+      (BAAI/bge-reranker-base relevance score) instead. Only made cheap
+      enough to be practical BECAUSE of clustering — calling the cross
+      encoder for every one of 2^n sentence coalitions would be too slow,
+      but 2^k cluster coalitions (k <= max_clusters) is tractable.
+    """
+ 
+    def __init__(
+        self,
+        model,
+        sentences,
+        query,
+        max_clusters=8,
+        redistribution="recursive",
+        cluster_max_samples=None,
+        sentence_max_samples=200,
+        batch_size=32,
+        cross_batch_size=16,
+        random_state=42,
+        use_loo_calibration=True,
+        shap_weight=0.65,
+        scoring="bi_encoder",
+    ):
+        if redistribution not in ("recursive", "attention"):
+            raise ValueError("redistribution must be 'recursive' or 'attention'")
+        if scoring not in ("bi_encoder", "cross_encoder"):
+            raise ValueError("scoring must be 'bi_encoder' or 'cross_encoder'")
+ 
+        self.model = model
+        self.sentences = list(sentences) if sentences is not None else []
+        self.query = query
+        self.max_clusters = int(max_clusters)
+        self.redistribution = redistribution
+        self.sentence_max_samples = int(sentence_max_samples)
+        self.cluster_max_samples = int(cluster_max_samples) if cluster_max_samples is not None else int(sentence_max_samples)
+        self.batch_size = int(batch_size)
+        self.cross_batch_size = int(cross_batch_size)
+        self.random_state = random_state
+        self.use_loo_calibration = bool(use_loo_calibration)
+        self.shap_weight = float(np.clip(shap_weight, 0.0, 1.0))
+        self.scoring = scoring
+ 
+        self.clusters = cluster_sentence_indices(
+            model, self.sentences,
+            max_clusters=self.max_clusters,
+            batch_size=self.batch_size,
+        )
+        self.k_clusters = len(self.clusters)
+ 
+    def _cluster_texts(self):
+        return [
+            " ".join(self.sentences[i] for i in members).strip()
+            for members in self.clusters
+        ]
+ 
+    def _attention_weights(self, member_indices):
+        member_sents = [self.sentences[i] for i in member_indices]
+        if self.scoring == "cross_encoder":
+            raw = self.model.predict_score_cross_batch(self.query, member_sents, batch_size=self.cross_batch_size)
+        else:
+            raw = self.model.predict_score_batch(self.query, member_sents, batch_size=self.batch_size)
+        raw = np.asarray(raw, dtype=float).reshape(-1)
+        raw = raw - np.max(raw)  # numerical stability
+        exp = np.exp(raw)
+        denom = float(np.sum(exp))
+        if denom < 1e-12:
+            return np.full(len(member_indices), 1.0 / len(member_indices))
+        return exp / denom
+ 
+    def _recursive_weights(self, member_indices):
+        """
+        Returns proportional weights (summing to 1) obtained by rerunning the
+        SmartSHAP core over the sentences of ONE cluster, using its raw
+        (unnormalized) regression coefficients so the eventual rescale to
+        the cluster's Shapley value is well-defined.
+        """
+        member_sents = [self.sentences[i] for i in member_indices]
+        raw_coef = _smartshap_core_from_units(
+            self.model, self.query, member_sents,
+            scoring=self.scoring,
+            max_samples=self.sentence_max_samples,
+            batch_size=self.batch_size,
+            cross_batch_size=self.cross_batch_size,
+            random_state=self.random_state,
+            use_loo_calibration=self.use_loo_calibration,
+            shap_weight=self.shap_weight,
+            return_raw_coef=True,
+        )
+        total = float(np.sum(raw_coef))
+        if abs(total) < 1e-9:
+            return np.full(len(member_indices), 1.0 / len(member_indices))
+        return raw_coef / total
+ 
+    def explain(self, n_samples=None, return_raw=False):
+        n = len(self.sentences)
+        if n == 0:
+            return np.array([], dtype=float)
+ 
+        # Degenerate case: clustering was skipped (n <= max_clusters), every
+        # cluster is a singleton -> this call is mathematically identical to
+        # SmartShapExplainer.explain() on the raw sentences.
+        cluster_texts = self._cluster_texts()
+        cluster_samples = n_samples if n_samples is not None else self.cluster_max_samples
+ 
+        cluster_raw_coef = _smartshap_core_from_units(
+            self.model, self.query, cluster_texts,
+            scoring=self.scoring,
+            max_samples=cluster_samples,
+            batch_size=self.batch_size,
+            cross_batch_size=self.cross_batch_size,
+            random_state=self.random_state,
+            use_loo_calibration=self.use_loo_calibration,
+            shap_weight=self.shap_weight,
+            return_raw_coef=True,
+        )
+ 
+        final_vals = np.zeros(n, dtype=float)
+        for c_idx, member_indices in enumerate(self.clusters):
+            cluster_value = float(cluster_raw_coef[c_idx])
+ 
+            if len(member_indices) == 1:
+                final_vals[member_indices[0]] = cluster_value
+                continue
+ 
+            if self.redistribution == "attention":
+                weights = self._attention_weights(member_indices)
+            else:
+                weights = self._recursive_weights(member_indices)
+ 
+            for pos, idx in enumerate(member_indices):
+                final_vals[idx] = cluster_value * weights[pos]
+ 
+        final_vals = _max_abs_normalize(final_vals)
+ 
+        if not return_raw:
+            return final_vals
+ 
+        return {
+            "normalized_coef": final_vals,
+            "clusters": self.clusters,
+            "num_clusters": self.k_clusters,
+            "cluster_raw_coef": cluster_raw_coef,
+            "redistribution": self.redistribution,
+            "scoring": self.scoring,
+            "num_sentences": n,
+        }
+ 
+ 
+class CrossEncoderBaselineExplainer:
+    """
+    Full-budget KernelSHAP baseline that explains the CROSS-ENCODER relevance
+    score (predict_score_cross_batch) instead of the bi-encoder similarity
+    used by BaselineExplainer. Required as ground truth whenever a method is
+    run with scoring="cross_encoder" — the bi-encoder baseline is no longer a
+    fair reference once the explained function itself has changed.
+ 
+    Only practical for a SMALL number of sentences (the cross-encoder is
+    called once per KernelSHAP-sampled coalition), which is exactly the
+    situation ClusterSmartShapExplainer is designed to avoid for the method
+    under test — but this baseline is still needed for short documents used
+    in controlled ablation studies (see the "does clustering lose fidelity"
+    experiment discussed for the thesis).
+    """
+ 
+    def __init__(self, model, sentences, query):
+        self.model = model
+        self.sentences = list(sentences) if sentences is not None else []
+        self.query = query
+ 
+    def explain(self, n_samples=1000, batch_size=16):
+        n = len(self.sentences)
+        if n == 0:
+            return np.array([], dtype=float)
+ 
+        def predict_fn(mask_matrix):
+            texts = [
+                " ".join(self.sentences[j] for j, m in enumerate(mask) if m > 0.5).strip()
+                for mask in mask_matrix
+            ]
+            return self.model.predict_score_cross_batch(self.query, texts, batch_size=batch_size)
+ 
+        explainer = shap.KernelExplainer(predict_fn, np.zeros((1, n)))
+        vals = explainer.shap_values(np.ones((1, n)), nsamples=n_samples, silent=True)
+ 
+        return np.asarray(vals[0] if isinstance(vals, list) else vals, dtype=float).reshape(-1)
+ 
