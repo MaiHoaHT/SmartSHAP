@@ -970,18 +970,6 @@ def cluster_sentence_indices(
     linkage="average",
     metric="cosine",
 ):
-    """
-    Semantic clustering of sentence indices using bi-encoder embeddings.
- 
-    If the document already has <= max_clusters sentences, clustering is
-    skipped and each sentence becomes its own singleton cluster — in that
-    case ClusterSmartShapExplainer degenerates exactly to the original
-    SmartShapExplainer (no information loss, no unnecessary clustering).
- 
-    Returns:
-        list[list[int]] — each inner list is the sentence indices belonging
-        to one cluster, ordered by the smallest member index for determinism.
-    """
     n = len(sentences)
     if n == 0:
         return []
@@ -1084,16 +1072,6 @@ def _smartshap_core_from_units(
     linear surrogate + optional LOO calibration — operating over abstract
     "units" (each unit_text is one player). A unit can be a single sentence
     (normal SmartSHAP) or a concatenated cluster text (Cluster-SmartSHAP).
- 
-    This mirrors SmartShapExplainer.explain() exactly, only generalized so it
-    can be reused at both the cluster level and, recursively, inside a
-    cluster during redistribution.
- 
-    Returns:
-        normalized attribution (max-abs, in [-1, 1]) by default, or the raw
-        (unnormalized) regression coefficients if return_raw_coef=True — the
-        raw coefficients are what should be used when the values will later
-        be rescaled to satisfy the efficiency axiom (sum = parent value).
     """
     n = len(unit_texts)
     if n == 0:
@@ -1137,35 +1115,7 @@ def _smartshap_core_from_units(
  
 class ClusterSmartShapExplainer:
     """
-    Hierarchical SmartSHAP.
- 
-    Pipeline:
-        sentences --(semantic clustering)--> clusters
-                  --(SmartSHAP core, cluster-level)--> cluster attribution
-                  --(redistribution)--> sentence attribution
- 
-    Redistribution modes:
-    - "recursive" (default, recommended): re-run the SmartSHAP core INSIDE
-      each cluster (coalition sampling + LOO calibration still apply at the
-      sentence level), then rescale so the sentence values inside a cluster
-      sum exactly to that cluster's raw Shapley coefficient. This preserves
-      the Shapley efficiency axiom end-to-end and keeps SmartSHAP's ability
-      to capture sentence-sentence interaction inside a cluster.
-    - "attention": cheaper heuristic — split the cluster value across member
-      sentences proportionally to their individual query-similarity
-      (softmax). Does not run coalition sampling inside the cluster, so it
-      does not capture intra-cluster interaction; provided mainly as a fast
-      baseline to quantify the "cost" of skipping recursive redistribution
-      (see the ablation design discussed for the thesis).
- 
-    scoring:
-    - "bi_encoder" (default): explains RecommenderModel.predict_score /
-      predict_score_batch (BAAI/bge-m3-style embedding similarity).
-    - "cross_encoder": explains RecommenderModel.predict_score_cross_batch
-      (BAAI/bge-reranker-base relevance score) instead. Only made cheap
-      enough to be practical BECAUSE of clustering — calling the cross
-      encoder for every one of 2^n sentence coalitions would be too slow,
-      but 2^k cluster coalitions (k <= max_clusters) is tractable.
+    Hierarchical SmartSHAP. 
     """
  
     def __init__(
@@ -1231,12 +1181,6 @@ class ClusterSmartShapExplainer:
         return exp / denom
  
     def _recursive_weights(self, member_indices):
-        """
-        Returns proportional weights (summing to 1) obtained by rerunning the
-        SmartSHAP core over the sentences of ONE cluster, using its raw
-        (unnormalized) regression coefficients so the eventual rescale to
-        the cluster's Shapley value is well-defined.
-        """
         member_sents = [self.sentences[i] for i in member_indices]
         raw_coef = _smartshap_core_from_units(
             self.model, self.query, member_sents,
@@ -1310,21 +1254,6 @@ class ClusterSmartShapExplainer:
  
  
 class CrossEncoderBaselineExplainer:
-    """
-    Full-budget KernelSHAP baseline that explains the CROSS-ENCODER relevance
-    score (predict_score_cross_batch) instead of the bi-encoder similarity
-    used by BaselineExplainer. Required as ground truth whenever a method is
-    run with scoring="cross_encoder" — the bi-encoder baseline is no longer a
-    fair reference once the explained function itself has changed.
- 
-    Only practical for a SMALL number of sentences (the cross-encoder is
-    called once per KernelSHAP-sampled coalition), which is exactly the
-    situation ClusterSmartShapExplainer is designed to avoid for the method
-    under test — but this baseline is still needed for short documents used
-    in controlled ablation studies (see the "does clustering lose fidelity"
-    experiment discussed for the thesis).
-    """
- 
     def __init__(self, model, sentences, query):
         self.model = model
         self.sentences = list(sentences) if sentences is not None else []
